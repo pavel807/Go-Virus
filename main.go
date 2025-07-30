@@ -2,103 +2,204 @@ package main
 
 import (
 	"fmt"
-	"io"
+	"io/ioutil"
+	"os"
 	"os/exec"
-	"strings"
+	"path/filepath"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
-// runCommand executes an external command and streams its output to the provided
-// tview.TextView. It runs the command in a separate goroutine to avoid
-// blocking the TUI.
-func runCommand(app *tview.Application, outputView *tview.TextView, command string) {
-	parts := strings.Split(command, " ")
-	cmd := exec.Command(parts[0], parts[1:]...)
+func buildBundle(app *tview.Application, logView *tview.TextView, mainAppPath, embeddedAppPath string) {
+	logView.Clear()
 
-	// Clear the output view and show a message that the command is starting.
-	outputView.Clear()
-	fmt.Fprintln(outputView, "Running command:", command)
-	fmt.Fprintln(outputView, "--------------------")
+	// Helper function to print to log and redraw
+	logAndDraw := func(message string) {
+		fmt.Fprintln(logView, message)
+		app.Draw()
+	}
 
-	// Get the command's output pipes
-	stdout, err := cmd.StdoutPipe()
+	if mainAppPath == "" || embeddedAppPath == "" {
+		logAndDraw("[red]Ошибка: Пожалуйста, укажите пути к обоим приложениям.")
+		return
+	}
+
+	logAndDraw("Начало сборки...")
+	logAndDraw(fmt.Sprintf("Главное приложение: %s", mainAppPath))
+	logAndDraw(fmt.Sprintf("Встраиваемое приложение: %s", embeddedAppPath))
+	logAndDraw("--------------------")
+
+	// Create a temporary directory
+	tempDir, err := ioutil.TempDir("", "app-bundler-")
 	if err != nil {
-		fmt.Fprintln(outputView, "Error creating stdout pipe:", err)
+		logAndDraw(fmt.Sprintf("Ошибка при создании временной директории: %s", err))
 		return
 	}
-	stderr, err := cmd.StderrPipe()
+	defer os.RemoveAll(tempDir)
+	logAndDraw(fmt.Sprintf("Временная директория создана: %s", tempDir))
+
+	// Copy files to the temporary directory
+	mainAppDest := filepath.Join(tempDir, "main_app")
+	embeddedAppDest := filepath.Join(tempDir, "embedded_app")
+
+	if err := copyFile(mainAppPath, mainAppDest); err != nil {
+		logAndDraw(fmt.Sprintf("Ошибка при копировании главного приложения: %s", err))
+		return
+	}
+	logAndDraw("Главное приложение скопировано.")
+
+	if err := copyFile(embeddedAppPath, embeddedAppDest); err != nil {
+		logAndDraw(fmt.Sprintf("Ошибка при копировании встраиваемого приложения: %s", err))
+		return
+	}
+	logAndDraw("Встраиваемое приложение скопировано.")
+
+	// Generate go.mod for the bundle
+	goModPath := filepath.Join(tempDir, "go.mod")
+	goModContent := "module app-bundle\n\ngo 1.16\n"
+	if err := ioutil.WriteFile(goModPath, []byte(goModContent), 0644); err != nil {
+		logAndDraw(fmt.Sprintf("Ошибка при создании go.mod: %s", err))
+		return
+	}
+	logAndDraw("go.mod создан.")
+
+	// Generate main.go for the bundle
+	mainGoPath := filepath.Join(tempDir, "main.go")
+	mainGoContent := `
+package main
+
+import (
+	_ "embed"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"os/exec"
+)
+
+//go:embed main_app
+var mainApp []byte
+
+//go:embed embedded_app
+var embeddedApp []byte
+
+func main() {
+	fmt.Println("Запуск главного приложения...")
+	runApp(mainApp, "main_app_temp")
+	fmt.Println("Запуск встраиваемого приложения...")
+	runApp(embeddedApp, "embedded_app_temp")
+	fmt.Println("Все готово.")
+}
+
+func runApp(appData []byte, fileName string) {
+	tmpfile, err := ioutil.TempFile("", fileName)
 	if err != nil {
-		fmt.Fprintln(outputView, "Error creating stderr pipe:", err)
+		fmt.Println("Ошибка при создании временного файла:", err)
+		return
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write(appData); err != nil {
+		fmt.Println("Ошибка при записи во временный файл:", err)
+		return
+	}
+	tmpfile.Close()
+
+	if err := os.Chmod(tmpfile.Name(), 0755); err != nil {
+		fmt.Println("Ошибка при изменении прав доступа к файлу:", err)
 		return
 	}
 
-	// Start the command
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintln(outputView, "Error starting command:", err)
+	cmd := exec.Command(tmpfile.Name())
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Println("Ошибка при запуске приложения:", err)
+	}
+}
+`
+	if err := ioutil.WriteFile(mainGoPath, []byte(mainGoContent), 0644); err != nil {
+		logAndDraw(fmt.Sprintf("Ошибка при создании main.go: %s", err))
 		return
 	}
+	logAndDraw("main.go создан.")
 
-	// Goroutine to stream stdout and stderr to the output view
-	go func() {
-		// We need to use a writer that is safe for concurrent writes.
-		// tview.TextView is not safe for concurrent writes, so we need to
-		// queue updates to be done in the main goroutine.
-		writer := tview.ANSIWriter(outputView)
-		go io.Copy(writer, stdout)
-		go io.Copy(writer, stderr)
-	}()
+	// Build the bundle
+	logAndDraw("Запуск сборки бандла...")
+	cmd := exec.Command("go", "build", "-o", "bundle")
+	cmd.Dir = tempDir
+	cmd.Stdout = logView
+	cmd.Stderr = logView
+	if err := cmd.Run(); err != nil {
+		logAndDraw(fmt.Sprintf("[red]Ошибка при сборке бандла: %s", err))
+		return
+	}
+	logAndDraw("Сборка бандла завершена.")
 
-	// Goroutine to wait for the command to finish
-	go func() {
-		err := cmd.Wait()
-		app.QueueUpdateDraw(func() {
-			if err != nil {
-				fmt.Fprintln(outputView, "--------------------")
-				fmt.Fprintln(outputView, "Command finished with error:", err)
-			} else {
-				fmt.Fprintln(outputView, "--------------------")
-				fmt.Fprintln(outputView, "Command finished successfully.")
-			}
-		})
-	}()
+	// Copy the bundle to the current directory
+	bundlePath := filepath.Join(tempDir, "bundle")
+	destPath := "bundle"
+	if err := copyFile(bundlePath, destPath); err != nil {
+		logAndDraw(fmt.Sprintf("Ошибка при копировании бандла: %s", err))
+		return
+	}
+	logAndDraw(fmt.Sprintf("Бандл скопирован в: %s", destPath))
+	logAndDraw("--------------------")
+	logAndDraw("[green]Сборка успешно завершена!")
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = out.ReadFrom(in)
+	if err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 func main() {
-	// Initialize the tview application.
 	app := tview.NewApplication()
 
-	// The text view that displays the output of the commands.
-	outputView := tview.NewTextView().
-		SetDynamicColors(true). // Enable color tags
+	// Log view
+	logView := tview.NewTextView().
 		SetScrollable(true).
-		SetChangedFunc(func() {
-			// Redraw the application whenever the text changes.
-			app.Draw()
-		})
-	outputView.SetBorder(true).SetTitle("Output")
+		SetDynamicColors(true)
+	logView.SetBorder(true).SetTitle("Логи")
 
-	// The list of commands to run.
-	list := tview.NewList().
-		AddItem("ping google.com", "A simple ping command.", 'a', func() {
-			runCommand(app, outputView, "ping google.com")
-		}).
-		AddItem("ls -l", "Lists files in the current directory.", 'b', func() {
-			runCommand(app, outputView, "ls -l")
-		}).
-		AddItem("Quit", "Exit the application.", 'q', func() {
-			app.Stop()
-		})
+	// Form for selecting files and building
+	form := tview.NewForm().
+		AddInputField("Главное приложение:", "", 40, nil, nil).
+		AddInputField("Встраиваемое приложение:", "", 40, nil, nil)
+	form.SetBorder(true).SetTitle("Выбор приложений")
 
-	// The main layout, a flexbox that contains the list and the output view.
+	// Build button
+	buildButton := tview.NewButton("--- BUILD ---").SetSelectedFunc(func() {
+		mainApp := form.GetFormItem(0).(*tview.InputField).GetText()
+		embeddedApp := form.GetFormItem(1).(*tview.InputField).GetText()
+		go buildBundle(app, logView, mainApp, embeddedApp)
+	})
+	buildButton.SetBackgroundColor(tcell.ColorDarkGreen)
+
+
+	// Layout
 	flex := tview.NewFlex().
-		// The list takes up 1/4 of the screen width.
-		AddItem(list, 0, 1, true).
-		// The output view takes up 3/4 of the screen width.
-		AddItem(outputView, 0, 3, false)
+		SetDirection(tview.FlexRow).
+		AddItem(form, 0, 1, true).
+		AddItem(buildButton, 3, 1, false).
+		AddItem(logView, 0, 2, false)
 
-	// Start the application.
-	if err := app.SetRoot(flex, true).SetFocus(list).Run(); err != nil {
+	if err := app.SetRoot(flex, true).Run(); err != nil {
 		panic(err)
 	}
 }
